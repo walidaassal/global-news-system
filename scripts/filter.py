@@ -1,15 +1,15 @@
 import os
 import json
 import gspread
-import time
+import re
 from google import genai
 from oauth2client.service_account import ServiceAccountCredentials
 
-# 1. Setup Gemini with the NEW library
+# 1. Setup Gemini with the 2026 STABLE model
 client_ai = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+MODEL_NAME = "gemini-2.5-flash" # Updated from 2.0 to 2.5
 
 def process_and_filter():
-    # Connect to Sheets
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
     creds_dict = json.loads(os.environ["GCP_SERVICE_ACCOUNT_KEY"])
     creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
@@ -19,50 +19,48 @@ def process_and_filter():
     raw_sheet = db.worksheet("Raw_Items")
     review_sheet = db.worksheet("Review")
 
-    # Get all news
-    records = raw_sheet.get_all_records()
+    # Get URLs to avoid duplicates
+    existing_entries = review_sheet.get_all_records()
+    existing_urls = [str(r.get('URL', '')) for r in existing_entries]
+
+    # Get raw news and limit to the top 15 most recent to avoid "Quota Overload"
+    records = raw_sheet.get_all_records()[:15] 
     if not records:
         print("No news to filter.")
         return
 
-    # Prepare a list of headlines for the AI
-    headlines_list = "\n".join([f"- {r['Title']}" for r in records])
+    headlines_list = "\n".join([f"{i+1}. {r['Title']}" for i, r in enumerate(records)])
 
     prompt = f"""
-    You are a senior news editor. Review this list of news headlines:
-    {headlines_list}
+    Score these news headlines from 1-10 based on global significance.
+    Return ONLY a JSON list of numbers. 
+    Example: [5, 8, 2]
 
-    Score each headline from 1-10 based on global significance and geopolitical impact.
-    Return ONLY a JSON list of numbers in the exact same order as the headlines.
-    Example output: [3, 8, 1, 10, 5]
+    Headlines:
+    {headlines_list}
     """
 
-    print(f"AI is analyzing {len(records)} articles in one batch...")
-    
-    # Send ONE request for ALL headlines
-    response = client_ai.models.generate_content(
-        model="gemini-2.0-flash", 
-        contents=prompt
-    )
+    print(f"AI is analyzing {len(records)} articles using {MODEL_NAME}...")
     
     try:
-        # Clean up the response text in case the AI adds markdown backticks
-        raw_output = response.text.replace("```json", "").replace("```", "").strip()
-        scores = json.loads(raw_output)
+        response = client_ai.models.generate_content(model=MODEL_NAME, contents=prompt)
+        # Remove any markdown code blocks the AI might add
+        clean_text = re.sub(r'```json|```', '', response.text).strip()
+        scores = json.loads(clean_text)
         
         for i, score in enumerate(scores):
-            if score >= 7:
-                article = records[i]
+            article = records[i]
+            if score >= 7 and article['URL'] not in existing_urls:
                 review_sheet.append_row([article['Title'], article['URL'], article['Source'], score])
-                print(f"✅ Kept: {article['Title'][:50]}... (Score: {score})")
+                print(f"✅ Kept: {article['Title'][:50]}")
         
-        # Clear raw sheet after successful processing
+        # Clear the processed rows
         raw_sheet.delete_rows(2, len(records) + 1)
-        print("Success! High-quality news moved to 'Review' tab.")
+        print("Success! High-quality news moved to Review.")
 
     except Exception as e:
-        print(f"Error parsing AI response: {e}")
-        print(f"AI actually said: {response.text}")
+        print(f"Error: {e}")
+        print(f"AI Response was: {response.text if 'response' in locals() else 'No response'}")
 
 if __name__ == "__main__":
     process_and_filter()
